@@ -1,0 +1,124 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 12 18:11:43 2025
+
+@author: ArushVatsal
+"""
+
+                                #        _==/          i     i          \==         #
+                                #      /XX/            |\___/|            \XX\      #
+                                #    /XXXX\            |XXXXX|            /XXXX\    #
+                                #   |XXXXXX\_         _XXXXXXX_         _/XXXXXX|   #
+                                #  XXXXXXXXXXXxxxxxxxXXXXXXXXXXXxxxxxxxXXXXXXXXXXX  #
+                                # |XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX| #
+                                # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX #
+                                # |XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX| #
+                                #  XXXXXX/^^^^"\XXXXXXXXXXXXXXXXXXXXX/^^^^^\XXXXXX  #
+                                #   |XXX|       \XXX/^^\XXXXX/^^\XXX/       |XXX|   #
+                                #     \XX\       \X/    \XXX/    \X/       /XX/     #
+                                #        "\       "      \X/      "       /"        #
+                                #                         !                         #
+
+
+
+
+import pandas as pd
+
+path = r"C:\Users\ArushVatsal\OneDrive - Indxx\Desktop\PD\LEGR\Composition\\"
+df_weight = pd.read_excel(path + 'prac.xlsx')
+eligible_ffmcap_sum = df_weight.loc[df_weight['Eligible'], 'ffmcap'].sum()
+df_weight['ff_mcap_weight'] = df_weight.apply(lambda row: row['ffmcap'] / eligible_ffmcap_sum if row['Eligible'] else 0, axis=1)
+
+# Define upper and lower caps
+UPPER_CAP = 0.15
+LOWER_CAP = 0.002  
+
+# Calculate initial weights 
+eligible_mask = df_weight['Eligible']
+eligible_ffmcap_sum = df_weight.loc[eligible_mask, 'ffmcap'].sum()
+df_weight['ff_mcap_weight'] = df_weight.apply(
+    lambda row: row['ffmcap'] / eligible_ffmcap_sum if row['Eligible'] else "",
+    axis=1
+)
+
+# Apply capping to eligible securities
+def apply_weight_caps(df, upper=UPPER_CAP, lower=LOWER_CAP):
+    df = df.copy()
+    df['capped_upper'] = False  # Track securities capped at upper limit
+    df['capped_lower'] = False  # Track securities capped at lower limit
+    df['adjusted_weight'] = df['ff_mcap_weight'].astype(float)
+    
+    max_iterations = 1000  # Prevent infinite loops
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        # Check for upper cap violations
+        upper_violations = df[(df['adjusted_weight'] > upper) & (~df['capped_upper'])]
+        if not upper_violations.empty:
+            # Cap the largest upper violation
+            largest_idx = upper_violations['adjusted_weight'].idxmax()
+            excess = df.at[largest_idx, 'adjusted_weight'] - upper
+            df.at[largest_idx, 'adjusted_weight'] = upper
+            df.at[largest_idx, 'capped_upper'] = True
+            
+            # Redistribute excess to uncapped securities
+            uncapped = df[~df['capped_upper'] & ~df['capped_lower']]
+            if uncapped.empty:
+                df.at[largest_idx, 'adjusted_weight'] += excess  # Revert if no redistribution possible
+                df.at[largest_idx, 'capped_upper'] = False
+            else:
+                total_uncapped = uncapped['adjusted_weight'].sum()
+                if total_uncapped == 0:
+                    df.loc[uncapped.index, 'adjusted_weight'] += excess / len(uncapped)
+                else:
+                    df.loc[uncapped.index, 'adjusted_weight'] += excess * (uncapped['adjusted_weight'] / total_uncapped)
+            continue
+        
+        # Check for lower cap violations
+        lower_violations = df[(df['adjusted_weight'] < lower) & (~df['capped_lower'])]
+        if not lower_violations.empty:
+            # Adjust the smallest lower violation
+            smallest_idx = lower_violations['adjusted_weight'].idxmin()
+            deficit = lower - df.at[smallest_idx, 'adjusted_weight']
+            df.at[smallest_idx, 'adjusted_weight'] = lower
+            df.at[smallest_idx, 'capped_lower'] = True
+            
+            # Subtract deficit from uncapped securities
+            uncapped = df[~df['capped_upper'] & ~df['capped_lower']]
+            if uncapped.empty:
+                df.at[smallest_idx, 'adjusted_weight'] -= deficit  # Revert if no redistribution possible
+                df.at[smallest_idx, 'capped_lower'] = False
+            else:
+                total_uncapped = uncapped['adjusted_weight'].sum()
+                if total_uncapped == 0:
+                    df.loc[uncapped.index, 'adjusted_weight'] -= deficit / len(uncapped)
+                else:
+                    df.loc[uncapped.index, 'adjusted_weight'] -= deficit * (uncapped['adjusted_weight'] / total_uncapped)
+            continue
+        
+        # Exit loop if no violations
+        break
+    
+    # Correct floating-point errors
+    total_weight = df['adjusted_weight'].sum()
+    if abs(total_weight - 1) > 1e-6:
+        diff = 1 - total_weight
+        adjust_idx = df['adjusted_weight'].idxmax()
+        df.at[adjust_idx, 'adjusted_weight'] += diff
+    
+    return df
+
+# Apply the capping function
+eligible_indices = df_weight[eligible_mask].index
+df_eligible = df_weight.loc[eligible_indices].copy()
+df_eligible = apply_weight_caps(df_eligible)
+
+# Update original dataframe
+df_weight.loc[eligible_indices, 'ff_mcap_weight'] = df_eligible['adjusted_weight']
+
+# Ensure ineligible entries are empty strings
+df_weight['ff_mcap_weight'] = df_weight.apply(
+    lambda row: row['ff_mcap_weight'] if row['Eligible'] else "",
+    axis=1
+)
