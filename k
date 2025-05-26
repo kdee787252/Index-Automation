@@ -1,0 +1,1 @@
+Built a Python tool that automatically calculates daily Value at Risk (VaR) for high-risk stocks and ETFs, comparing them against benchmark indices. If risk levels exceed a 1.8 threshold, the system sends alerts to the product team via email with detailed Excel reports.
