@@ -1,0 +1,468 @@
+
+import pandas as pd
+import pyodbc
+
+path = (r'C:\Users\ArushVatsal\OneDrive - Indxx\Desktop\PD\\')
+df = pd.read_excel(path + '3-08-2015.xlsx')
+
+selection_date = pd.to_datetime('2015-08-03') # put date
+selection_date_st = selection_date.strftime('%Y-%m-%d')
+df['First_Trade_Date'] = pd.to_datetime(df['First_Trade_Date'], errors='coerce')
+
+#put countries and threshold
+valid_countries = ['India']
+mcap_threshold = 500
+ff_threshold = 10
+price_threshold = 10000
+exchange_list = ['SHG','SHE','OTC']
+security_type_2 = ['SHARE']
+elig_sec_type_1 = ["Equity","Equity; some share ownership restricted to domestic residents","Depository receipt","Equity; all share ownership restricted to domestic residents"]
+condition = (df['TD_Eligibility_3M'] == 'No') & (df['TD_Eligibility_6M'] == 'No')
+
+
+df['Country_Check'] = df['Listing_Country'].isin(valid_countries)
+df['Mcap_Check'] = df['Final_Mcap'] >= mcap_threshold
+df['FTD_Check'] = df['First_Trade_Date'] < df['Selection_Date']
+df['LTD_Check'] = df['Last_Trade_Date'] > df['Selection_Date']
+df['FF_Check'] = df['Final_FF'] >= ff_threshold
+df['Price_Check'] = df['Price_USD'] <= price_threshold
+df['Exchange_Check'] = ~df['Exchange_Code'].isin(exchange_list)
+df['Trading_Check'] = ~condition
+df['ADTV_Check'] = ~df['ADTV_6M'].isna()
+df['Security_Type_2_Check'] = df['Security_Type_2_Code'].isin(security_type_2)
+df['Security_Type_1_Check'] = df['Security_Type_1'].isin(elig_sec_type_1)
+
+
+
+
+df['Eligible'] = df[['Country_Check','Mcap_Check','ADTV_Check','Price_Check','FF_Check','Trading_Check','Exchange_Check','FTD_Check','LTD_Check','Security_Type_2_Check','Security_Type_1_Check']].all(axis=1)
+df_eligible = df[df['Eligible']]
+
+
+def mark_duplicates(df):
+    df_sorted = df_eligible.sort_values(by=['Entity_ID', 'ADTV_6M'], ascending=[True,False])
+    df_sorted['Duplicate_Check'] = ~df_sorted.duplicated(subset='Entity_ID', keep='first')
+    df_sorted = df_sorted.sort_index()
+    return df_sorted
+df_eligible = mark_duplicates(df)
+
+df = pd.merge(df, df_eligible[['Ticker', 'Duplicate_Check']], on='Ticker', how='left')
+df['Duplicate_Check'] = df['Duplicate_Check'].fillna(False)
+
+
+conn = pyodbc.connect('')
+ticker = df_final['Ticker'].values.astype(str)
+fsym_id = df_final['Fsym_ID'].values.astype(str)
+
+sel_date_str = '2015-08-03'
+sel_date_1_year_back = '2014-08-03'
+
+
+
+eps = '''
+--declare @start_date date = ''
+declare @end_date date = ''' + "'" + str((sel_date_str)) + "'" + '''
+select t.ticker_region
+,cr.date
+,case when fx1.iso_currency <>'USD' then cr.ff_eps/fx1.exch_rate_per_usd else cr.ff_eps end as a_earnings_per_share
+from
+sym_v1.sym_ticker_region as t
+
+left join (select 
+cr.fsym_id as FSYM
+,max(cr.date) as CR_Date
+from 
+ff_v3.ff_advanced_af as cr
+where --cr.date >=@start_date and 
+cr.date <=@end_date
+group by
+cr.fsym_id) as Current_Ratio on t.fsym_id = Current_ratio.FSYM
+
+left join  ff_v3.ff_advanced_af as cr on t.fsym_id = cr.fsym_id and cr.date = current_ratio.cr_date
+left join sym_v1.sym_coverage as id on t.fsym_id = id.fsym_id
+left join ref_v2.econ_fx_rates_usd as fx1 on id.currency = fx1.iso_currency and fx1.exch_date = current_ratio.cr_date
+where t.ticker_region in ''' + str(tuple(ticker)) + '''
+'''
+split_price_latest = '''
+DROP TABLE #ids
+DECLARE @start_date as DATE = ''' + "'" + str((sel_date_str)) + "'" + '''
+select fsym_id into #ids from sym_v1.sym_coverage where fsym_id in ''' + str(tuple(fsym_id)) + '''
+select 
+t.fsym_id, t.ticker_region, END_PRICE.P_PRICE*isnull(factor.split_factor,1) AS ADJ_END_PR_LOCAL
+,case when fx.iso_currency <>'USD' then END_PRICE.P_PRICE*isnull(factor.split_factor,1)/fx.exch_rate_per_usd 
+else END_PRICE.P_PRICE*isnull(factor.split_factor,1)  end as ADJ_END_PR_USD
+,ISNULL(FACTOR.SPLIT_FACTOR,1) AS split_factor
+from sym_v1.sym_ticker_Region as t
+--SPLIT_FACTOR
+left join(
+select t.TICKER_REGION as TICK
+,isnull(exp(sum(log(sp.p_split_factor))),1) as split_factor 
+from sym_v1.sym_ticker_Region as t
+left join fp_v2.fp_basic_splits as sp on t.fsym_id = sp.fsym_id
+where t.fsym_id in (select fsym_id from #ids)
+and sp.p_split_date > ''' + "'" + str((sel_date_str)) + "'" + ''' group by t.ticker_region) as factor on t.ticker_region = factor.TICK
+left join fp_v2.fp_basic_prices as start_Price on t.fsym_id= start_price.fsym_id and start_price.p_date = ''' + "'" + str((sel_date_str)) + "'" + '''
+left join fp_v2.fp_basic_prices as end_price on t.fsym_id= end_price.fsym_id and end_price.p_date = ''' + "'" + str((sel_date_str)) + "'" + '''
+left join sym_v1.sym_coverage as id on t.fsym_id = id.fsym_id
+left join ref_v2.econ_fx_rates_usd as fx on id.currency = fx.iso_currency and fx.exch_date = ''' + "'" + str((sel_date_str)) + "'" + '''
+WHERE t.fsym_id in (select fsym_id from #ids)
+group by
+t.fsym_id, t.ticker_region, start_price.p_price
+,end_price.p_price, factor.split_factor, fx.iso_currency,fx.exch_rate_per_usd
+'''
+
+split_price_minus1 = '''
+DROP TABLE #ids
+DECLARE @start_date as DATE = ''' + "'" + str((sel_date_2_years_back)) + "'" + '''
+select fsym_id into #ids from sym_v1.sym_coverage where fsym_id in ''' + str(tuple(fsym_id)) + '''
+select 
+t.fsym_id, t.ticker_region, END_PRICE.P_PRICE*isnull(factor.split_factor,1) AS ADJ_END_PR_LOCAL
+,case when fx.iso_currency <>'USD' then END_PRICE.P_PRICE*isnull(factor.split_factor,1)/fx.exch_rate_per_usd 
+else END_PRICE.P_PRICE*isnull(factor.split_factor,1)  end as ADJ_END_PR_USD
+,ISNULL(FACTOR.SPLIT_FACTOR,1) AS split_factor
+from sym_v1.sym_ticker_Region as t
+--SPLIT_FACTOR
+left join(
+select t.TICKER_REGION as TICK
+,isnull(exp(sum(log(sp.p_split_factor))),1) as split_factor 
+from sym_v1.sym_ticker_Region as t
+left join fp_v2.fp_basic_splits as sp on t.fsym_id = sp.fsym_id
+where t.fsym_id in (select fsym_id from #ids)
+and sp.p_split_date > ''' + "'" + str((sel_date_1_year_back)) + "'" + ''' group by t.ticker_region) as factor on t.ticker_region = factor.TICK
+left join fp_v2.fp_basic_prices as start_Price on t.fsym_id= start_price.fsym_id and start_price.p_date = ''' + "'" + str((sel_date_1_year_back)) + "'" + '''
+left join fp_v2.fp_basic_prices as end_price on t.fsym_id= end_price.fsym_id and end_price.p_date = ''' + "'" + str((sel_date_1_year_back)) + "'" + '''
+left join sym_v1.sym_coverage as id on t.fsym_id = id.fsym_id
+left join ref_v2.econ_fx_rates_usd as fx on id.currency = fx.iso_currency and fx.exch_date = ''' + "'" + str((sel_date_1_year_back)) + "'" + '''
+WHERE t.fsym_id in (select fsym_id from #ids)
+group by
+t.fsym_id, t.ticker_region, start_price.p_price
+,end_price.p_price, factor.split_factor, fx.iso_currency,fx.exch_rate_per_usd
+'''
+
+df_eps = pd.read_sql_query(eps, conn)
+df_price = pd.read_sql_query(split_price_latest, conn)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jan 16 11:14:54 2025
+
+@author: ArushVatsal
+
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+import pyodbc
+from datetime import datetime, timedelta
+import smtplib
+from email.message import EmailMessage
+import os
+
+tickers_list = ['BABA-US','AMZN-US','UBER-US','META-US','COIN-US','COIN-US','TSLA-US','TSLA-US','TSLA-US','MSFT-US','CRWD-US','PLTR-US','NVDA-US','NVDA-US','AMD-US','TSM-US','MU-US','AMD-US','AAPL-US','AMZN-US','AMZN-US','NFLX-US','NFLX-US','GOOGL-US','GOOGL-US','META-US','META-US','TSLA-US','TSLA-US','MSFT-US','MSFT-US','NVDA-US','NVDA-US','TSM-US','TSM-US','AVGO-US','AVGO-US','MU-US','MU-US','AAPL-US','AAPL-US']
+index_tickers = ['IHVRI','IHVRI','IHVISI','IHVISI','IHVIBI','IHVIBI','IHVMVI','IHVMVI','IHVMVI','IHVPSIT','IHVPSIT','IHVPSIT','IHVSIIT','IHVSIIT','IHVSIIT','IHVSIIT','IHVSIIT','IHVSIIT','IHVTEIIT','IIRIHVI','IIRIHVI','IISSIHVI','IISSIHVI','IISSIHVI','IISSIHVI','IISSIHVI','IISSIHVI','IMVIHVI','IMVIHVI','IPSIHVI','IPSIHVI','ISIHVI','ISIHVI','ISIHVI','ISIHVI','ISIHVI','ISIHVI','ISIHVI','ISIHVI','ITEIHVI','ITEIHVI']
+unique_tickers = list(set(tickers_list))
+unique_index_tickers = list(set(index_tickers))
+
+path = (r'C:\Users\ArushVatsal\OneDrive - Indxx\Desktop\VAR\Index Values\\')
+
+
+def set_to_yesterday():
+    yesterday = datetime.now() - timedelta(1)
+    return yesterday.strftime('%Y-%m-%d')
+
+def set_to_six_years_back():
+    three_years_back = datetime.now() - timedelta(days=6*365+21)
+    return three_years_back.strftime('%Y-%m-%d')
+sel_date = set_to_yesterday()
+end_date = set_to_six_years_back()
+
+prc_data = []
+price_data_dict = {} 
+for ticker in unique_tickers:
+    conn = pyodbc.connect('DRIVER={SQL Server};SERVER=65.0.33.214;DATABASE=FDS_DataFeeds;UID=Review-Team-FDSuser;PWD=sdjfRqTYmn%(501; Trusted connection=True')
+    fsym_id_query = f'''
+    SELECT fsym_id
+    FROM sym_v1.sym_ticker_region WHERE ticker_region = '{ticker}'
+    '''
+    fsym_id_df = pd.read_sql(fsym_id_query,conn)
+    
+    fsym_id = fsym_id_df['fsym_id'].iloc[0]
+    
+    spltprc_query = '''
+    DECLARE @end_date as DATE = ''' + "'" + str((sel_date)) + "'" + '''
+    DECLARE @start_date as DATE = ''' + "'" + str((end_date)) + "'" + '''
+    DROP TABLE IF EXISTS #akki123
+    CREATE TABLE #akki123(
+    Fsym_ID VARCHAR(50), Ticker VARCHAR(50), Split_Adj_Prc_LOCAL FLOAT, Split_Adj_Prc_USD FLOAT, As_of_Date DATE, Split_Factor FLOAT)
+    
+    WHILE @start_date <= @end_date
+    BEGIN
+    	DECLARE @temp_date as DATE = @start_date
+        --Input
+        SET NOCOUNT ON
+        DROP TABLE IF EXISTS #ids
+        select fsym_id into #ids from sym_v1.sym_coverage where fsym_id = ''' + "'" + str(fsym_id) + "'" + '''
+     
+    	--INSERT INTO #akki123 (t.fsym_id, t.ticker_region, ADJ_END_PR_LOCAL, ADJ_END_PR_USD, AsOfDate, split_factor)
+     
+    	INSERT INTO #akki123 (Fsym_ID, Ticker, Split_Adj_Prc_LOCAL, Split_Adj_Prc_USD, As_of_Date, Split_Factor)
+     
+    	select
+    	t.fsym_id
+    	,t.ticker_region
+    	--,(end_price.p_price/start_price.p_price)/ISNULL(FACTOR.SPLIT_FACTOR,1)-1 AS PR_RETURN
+    	--,START_PRICE.p_price AS START_PR
+    	,END_PRICE.P_PRICE*isnull(factor.split_factor,1) AS ADJ_END_PR_LOCAL
+    	,case when fx.iso_currency <>'USD' then END_PRICE.P_PRICE*isnull(factor.split_factor,1)/fx.exch_rate_per_usd else END_PRICE.P_PRICE*isnull(factor.split_factor,1)  end as ADJ_END_PR_USD
+    	,@temp_date as AsOfDate
+    	,ISNULL(FACTOR.SPLIT_FACTOR,1) AS split_factor
+    	from
+    	sym_v1.sym_ticker_Region as t
+    	--SPLIT_FACTOR
+    	left join(
+    	select t.TICKER_REGION as TICK
+    	,isnull(exp(sum(log(sp.p_split_factor))),1) as split_factor
+    	from
+    	sym_v1.sym_ticker_Region as t
+    	left join fp_v2.fp_basic_splits as sp on t.fsym_id = sp.fsym_id
+    	where t.fsym_id in (select fsym_id from #ids)
+    	and sp.p_split_date > @temp_date
+    	group by
+    	t.ticker_region
+    	) as factor on t.ticker_region = factor.TICK
+    	left join fp_v2.fp_basic_prices as start_Price on t.fsym_id= start_price.fsym_id and start_price.p_date = @temp_date
+    	left join fp_v2.fp_basic_prices as end_price on t.fsym_id= end_price.fsym_id and end_price.p_date = @temp_date
+    	left join sym_v1.sym_coverage as id on t.fsym_id = id.fsym_id
+    	left join ref_v2.econ_fx_rates_usd as fx on id.currency = fx.iso_currency and fx.exch_date = @temp_date
+    	WHERE t.fsym_id in (select fsym_id from #ids)
+    	group by
+    	t.fsym_id
+    	,t.ticker_region
+    	,start_price.p_price
+    	,end_price.p_price
+    	,factor.split_factor
+    	,fx.iso_currency
+    	,fx.exch_rate_per_usd
+    	SET @start_date = convert(varchar(30), dateadd(day,1, @start_date), 101)
+    END
+    SELECT *FROM #akki123
+    DROP TABLE #akki123
+    '''
+    
+    df_price = pd.read_sql(spltprc_query,conn)
+    df_price['As_of_Date'] = pd.to_datetime(df_price['As_of_Date'])
+    
+    price_dict = {row['As_of_Date']:row['Split_Adj_Prc_USD'] for index, row in df_price.iterrows()}
+    price_data_dict[ticker] = price_dict
+
+conn.close()
+
+index_value_dict = {}      
+for ticker in unique_index_tickers:    
+    conn1 = pyodbc.connect('DRIVER={SQL Server};SERVER=15.207.231.163;DATABASE=Ical3;UID=Arush_Vatsal;PWD=iDdA6a9nkr; Trusted connection=True')
+    index_value_query = '''
+    SELECT indexTicker,indexValue,vd FROM closingfiledetails where vd >= ''' + "'" + str((end_date)) + "'" + ''' and vd<= ''' + "'" + str((sel_date)) + "'" + '''  and indexTicker = ''' + "'" + str(ticker) + "'" + '''
+    '''
+    df_index_value = pd.read_sql(index_value_query,conn1)
+    df_excel = pd.read_excel(f"{path}{ticker}.xlsx")
+    df_index_value['vd'] = pd.to_datetime(df_index_value['vd'])
+    df_excel['date'] = pd.to_datetime(df_excel['date'])
+    df_index_value['vd'] = pd.to_datetime(df_index_value['vd'])
+
+    df_excel['date'] = pd.to_datetime(df_excel['date'])
+
+    merged_df = pd.merge(df_index_value, df_excel, left_on='vd', right_on='date', how='outer')
+    merged_df['indexValue'] = merged_df['value'].combine_first(merged_df['indexValue'])
+    merged_df['vd'] = merged_df['date'].combine_first(merged_df['vd'])
+    merged_df = merged_df.drop(columns=['value', 'date'])
+    merged_df = merged_df.rename(columns={'vd': 'date'})
+
+ 
+    index_dict = {row['date']:row['indexValue'] for index, row in merged_df.iterrows()}
+    index_value_dict[ticker] = index_dict
+          
+  
+    
+calculations = [
+    {'name': 'BABX- Indxx High Volatility Internet Retail Industry Index', 'ticker1': 'BABA-US', 'ticker2': 'IHVRI'},
+    {'name': 'AMZZ- Indxx High Volatility Internet Retail Industry Index', 'ticker1': 'AMZN-US', 'ticker2': 'IHVRI'},
+    {'name': 'UBRL- Indxx High Volatility Internet Software Services Industry Index ', 'ticker1': 'UBER-US', 'ticker2': 'IHVISI'},
+    {'name': 'FBL- Indxx High Volatility Internet Software Services Industry Index ', 'ticker1': 'META-US', 'ticker2': 'IHVISI'},
+    {'name': 'CONL- Indxx High Volatility Investment Banks/Broker Industry Index', 'ticker1': 'COIN-US', 'ticker2': 'IHVIBI'},
+    {'name': 'CONI- Indxx High Volatility Investment Banks/Broker Industry Index', 'ticker1': 'COIN-US', 'ticker2': 'IHVIBI'},
+    {'name': 'TSLR- Indxx High Volatility Motor Vehicle Industry Index', 'ticker1': 'TSLA-US', 'ticker2': 'IHVMVI'},
+    {'name': 'TSDD- Indxx High Volatility Motor Vehicle Industry Index', 'ticker1': 'TSLA-US', 'ticker2': 'IHVMVI'},
+    {'name': 'TSL- Indxx High Volatility Motor Vehicle Industry Index', 'ticker1': 'TSLA-US', 'ticker2': 'IHVMVI'},
+    {'name': 'MSFL- Indxx High Volatility Packaged Software Industry Index', 'ticker1': 'MSFT-US', 'ticker2': 'IHVPSIT'},
+    {'name': 'CRWL- Indxx High Volatility Packaged Software Industry Index', 'ticker1': 'CRWD-US', 'ticker2': 'IHVPSIT'},
+    {'name': 'PTIR- Indxx High Volatility Packaged Software Industry Index', 'ticker1': 'PLTR-US', 'ticker2': 'IHVPSIT'},
+    {'name': 'NVDL- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'NVDA-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'NVD- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'NVDA-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'AMDL- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'AMD-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'TSMU- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'TSM-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'MULL- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'MU-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'AMDS- Indxx High Volatility Semiconductor Industry Index', 'ticker1': 'AMD-US', 'ticker2': 'IHVSIIT'},
+    {'name': 'AAPB- Indxx High Volatility Telecommunication Equipment Industry Index', 'ticker1': 'AAPL-US', 'ticker2': 'IHVTEIIT'},
+    {'name': 'AMZD - Indxx Internet Retail Industry HV Index', 'ticker1': 'AMZN-US', 'ticker2': 'IIRIHVI'},
+    {'name': 'AMZU- Indxx Internet Retail Industry HV Index', 'ticker1': 'AMZN-US', 'ticker2': 'IIRIHVI'},
+    {'name': 'NFXL- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'NFLX-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'NFXS- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'NFLX-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'GGLS- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'GOOGL-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'GGLL- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'GOOGL-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'METU- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'META-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'METD- Indxx Internet Software /Services Industry HV Index', 'ticker1': 'META-US', 'ticker2': 'IISSIHVI'},
+    {'name': 'TSLS- Indxx Motor Vehicle Industry HV Index', 'ticker1': 'TSLA-US', 'ticker2': 'IMVIHVI'},
+    {'name': 'TSLL- Indxx Motor Vehicle Industry HV Index', 'ticker1': 'TSLA-US', 'ticker2': 'IMVIHVI'},
+    {'name': 'MSFD- Indxx Packaged Software Industry HV Index', 'ticker1': 'MSFT-US', 'ticker2': 'IPSIHVI'},
+    {'name': 'MSFU- Indxx Packaged Software Industry HV Index', 'ticker1': 'MSFT-US', 'ticker2': 'IPSIHVI'},
+    {'name': 'NVDU - Indxx Semiconductor Industry HV Index', 'ticker1': 'NVDA-US', 'ticker2': 'ISIHVI'},
+    {'name': 'NVDD- Indxx Semiconductor Industry HV Index', 'ticker1': 'NVDA-US', 'ticker2': 'ISIHVI'},
+    {'name': 'TSMX- Indxx Semiconductor Industry HV Index', 'ticker1': 'TSM-US', 'ticker2': 'ISIHVI'},
+    {'name': 'TSMZ- Indxx Semiconductor Industry HV Index', 'ticker1': 'TSM-US', 'ticker2': 'ISIHVI'},
+    {'name': 'AVL- Indxx Semiconductor Industry HV Index', 'ticker1': 'AVGO-US', 'ticker2': 'ISIHVI'},
+    {'name': 'AVS- Indxx Semiconductor Industry HV Index', 'ticker1': 'AVGO-US', 'ticker2': 'ISIHVI'},
+    {'name': 'MUU- Indxx Semiconductor Industry HV Index', 'ticker1': 'MU-US', 'ticker2': 'ISIHVI'},
+    {'name': 'MUD- Indxx Semiconductor Industry HV Index', 'ticker1': 'MU-US', 'ticker2': 'ISIHVI'},
+    {'name': 'AAPD- Indxx Telecommunication Equipment Industry HV Index', 'ticker1': 'AAPL-US', 'ticker2': 'ITEIHVI'},
+    {'name': 'AAPU- Indxx Telecommunication Equipment Industry HV Index', 'ticker1': 'AAPL-US', 'ticker2': 'ITEIHVI'}
+]
+
+
+
+
+def get_df_for_ticker(ticker, price_data_dict, date_col, value_col):
+    data = [(ticker, date, price) for date, price in price_data_dict[ticker].items()]
+    return pd.DataFrame(data, columns=['Ticker', date_col, value_col])
+
+def get_df_for_ticker2(ticker, price_data_dict, date_col, value_col):
+    data = [(ticker, date, price) for date, price in price_data_dict[ticker].items()]
+    return pd.DataFrame(data, columns=['Index_Ticker', date_col, value_col])
+
+def sanitize_sheet_name(name):
+    invalid_chars = ['/', '\\', '*', '?', ':', '[', ']']
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    return name
+
+def find_modified_z(col, window_size=783, z_score=norm.ppf(0.01), constant_sqrt=np.sqrt(20)):
+    
+    col_series = pd.Series(col)
+    
+
+    rolling_avg = col_series.rolling(window=window_size).mean()
+    
+    rolling_std = col_series.rolling(window=window_size).std(ddof=0)
+    
+    results = (rolling_avg - (rolling_std * z_score)) * constant_sqrt
+    
+    return results
+final_dfs = {}
+results = {}
+for calc in calculations:
+    name = calc['name']
+    ticker1 = calc['ticker1']
+    ticker2 = calc['ticker2']
+
+    
+    df1 = get_df_for_ticker(ticker1, price_data_dict, 'Date', 'Price_USD')
+    df2 = get_df_for_ticker2(ticker2, index_value_dict, 'Date', 'Index_Value')
+    final_df = pd.merge(df1, df2, on='Date')
+    final_df = final_df.sort_values(by='Date', ascending=True)
+    if pd.isna(final_df['Price_USD'].iloc[-1]) or final_df['Price_USD'].iloc[-1] == '':
+        final_df.loc[final_df.index[-1], 'Price_USD'] = final_df['Price_USD'].iloc[-2]
+    final_df['Daily Change Index'] = final_df['Index_Value'].pct_change()
+    
+    final_df['Daily Change Ticker'] = final_df['Price_USD'].pct_change()
+    
+    final_df['VaR_Index'] = find_modified_z(final_df['Daily Change Index'][1:])
+    final_df['VaR_Security'] = find_modified_z(final_df['Daily Change Ticker'][1:])
+    final_df['VaR_Ratio'] = final_df['VaR_Security']*2/final_df['VaR_Index']
+    results[name] = final_df
+    final_dfs[name] = final_df
+    max_ratios = []
+    printed_names = set()
+for name, final_df in results.items():
+
+    last_row_date = final_df.iloc[-1]['Date']
+    last_row_ratio = final_df.iloc[-1]['VaR_Ratio']
+    
+    max_ratios.append({'name': name,
+                       'as_of_date': last_row_date,
+                       'VaR_Ratio': last_row_ratio})
+        
+        
+    VAR_df = pd.DataFrame(max_ratios)
+    
+    
+trigger_df = VAR_df[VAR_df['VaR_Ratio'] > 1.8]
+if not trigger_df.empty:
+    print("For below indices, the ratio crossed the threshold of 1.8:")
+    for index, row in trigger_df.iterrows():
+        print(f"Index: {index}, Name: {row['name']}, VaR Ratio: {row['VaR_Ratio']}")
+else:
+    print("No ratios crossed the threshold of 1.8.")
+with pd.ExcelWriter(path + f'output_{sel_date}.xlsx') as writer:
+    VAR_df.to_excel(writer, sheet_name='Ratios', index=False)
+    for name, df in final_dfs.items():
+        sanitized_name = sanitize_sheet_name(name)
+        df.to_excel(writer, sheet_name=sanitized_name, index=False)
+        
+def send_mail_ATTACHMENT(to,subject,content,attachment_list):
+    msg=EmailMessage()
+    if not  isinstance(attachment_list, list):
+        return print('to and attachement_list parameters should be list')
+    print('Sending Email..')
+    msg['From']='notifications@indxx.com'
+    msg['To']=to
+    msg['SUBJECT']=subject
+    msg.set_content(content)
+    for i in attachment_list:
+        f=open(i,'rb')
+        f_data = f.read()
+        filename = os.path.basename(i)
+        msg.add_attachment(f_data,maintype='application',subtype='octet-stream',filename=filename)
+ 
+    mailserver= smtplib.SMTP('smtp.office365.com',587)
+    mailserver.starttls()
+    mailserver.ehlo()
+    mailserver.login('notifications@indxx.com',"U37Zkx6tP6v")
+    mailserver.send_message(msg)
+    print('MAIL SENT SUCCESSFULLY')
+
+trigger_df = VAR_df[VAR_df['VaR_Ratio'] > 1.8]
+if not trigger_df.empty:
+    content = "For below indices, the ratio crossed the threshold of 1.8:\n"
+    for index, row in trigger_df.iterrows():
+        content += f"Index: {index}, Name: {row['name']}, VaR Ratio: {row['VaR_Ratio']}\n"
+else:
+    content = "No ratios crossed the threshold of 1.8."
+ 
+content = f'Hi Team,\n\nPFA VAR Report.\n\n{content}\n\nThanks,\nOptech'
+    
+output_file = path + f'output_{sel_date}.xlsx'
+file_name = os.path.basename(output_file)
+to_list=['complex@indxx.com','adesh@indxx.com']    
+send_mail_ATTACHMENT(to_list,"""VAR Report""",content,attachment_list=[output_file])
+
+ 
+
